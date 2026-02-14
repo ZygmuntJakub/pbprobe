@@ -1,0 +1,17 @@
+[package]
+name = "dbprobe"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight database wire protocol interceptor with TUI"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ratatui = "0.29"
+crossterm = "0.28"
+chrono = "0.4"
+anyhow = "1.0.101"

@@ -1,0 +1,10 @@
+/target
+
+# Documentation
+RUST_DEEP_DIVE.md
+DATABASE_ARCHITECTURE.md
+ROADMAP.md
+CLAUDE.md
+
+# Claude
+.claude/
