@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let (tx, rx) = mpsc::channel::<ProxyMessage>(1024);
+    let (tx, rx) = mpsc::unbounded_channel::<ProxyMessage>();
 
     let listen_addr = format!("0.0.0.0:{}", cli.listen_port);
     let upstream_addr = cli.upstream.clone();
@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_raw_mode(mut rx: mpsc::Receiver<ProxyMessage>) {
+async fn run_raw_mode(mut rx: mpsc::UnboundedReceiver<ProxyMessage>) {
     let mut stats = StatsCollector::new();
     let mut sink = RawSink::new();
 

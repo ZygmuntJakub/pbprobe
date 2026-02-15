@@ -1,4 +1,5 @@
 /target
+bench/node_modules/
 
 # Documentation
 RUST_DEEP_DIVE.md

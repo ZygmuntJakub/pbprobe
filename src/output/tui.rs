@@ -7,11 +7,50 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, BarChart};
+use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::proxy::ProxyMessage;
 use crate::stats::{QueryAggregates, StatsCollector};
 use super::{DisplayEvent, DisplayEventKind};
+
+#[derive(Serialize)]
+struct Snapshot {
+    timestamp: String,
+    total_queries: u64,
+    total_errors: u64,
+    active_connections: u64,
+    latency_buckets: LatencyBuckets,
+    top_queries: Vec<SnapshotQuery>,
+    recent_events: Vec<SnapshotEvent>,
+}
+
+#[derive(Serialize)]
+struct LatencyBuckets {
+    under_1ms: u64,
+    ms_1_5: u64,
+    ms_5_10: u64,
+    ms_10_50: u64,
+    ms_50_100: u64,
+    over_100ms: u64,
+}
+
+#[derive(Serialize)]
+struct SnapshotQuery {
+    fingerprint: String,
+    count: u64,
+    avg_ms: f64,
+    min_ms: f64,
+    max_ms: f64,
+}
+
+#[derive(Serialize)]
+struct SnapshotEvent {
+    time: String,
+    conn_id: u64,
+    latency: String,
+    message: String,
+}
 
 const MAX_EVENTS: usize = 10_000;
 
@@ -19,7 +58,11 @@ struct QueryRow {
     time: String,
     conn_id: u64,
     latency: String,
-    sql: String,
+    /// Raw SQL for query events (used for fingerprint toggle), None for non-query rows.
+    raw_sql: Option<String>,
+    rows_suffix: String,
+    /// Pre-formatted display text for non-query events; ignored when raw_sql is Some.
+    display: String,
     style: Style,
 }
 
@@ -60,18 +103,13 @@ impl TuiApp {
         let time = display_event.wall_time.format("%H:%M:%S%.3f").to_string();
         let conn_id = display_event.conn_id;
 
-        let (latency, sql, style) = match &display_event.kind {
+        let (latency, raw_sql, rows_suffix, display, style) = match &display_event.kind {
             DisplayEventKind::Query { sql, duration, rows } => {
                 let ms = duration.as_secs_f64() * 1000.0;
                 let latency = format!("{ms:.1}ms");
-                let rows_str = rows.map(|r| format!(" [{r}]")).unwrap_or_default();
-                let sql_display = if self.show_fingerprints {
-                    crate::fingerprint::fingerprint(sql)
-                } else {
-                    sql.clone()
-                };
+                let rows_suffix = rows.map(|r| format!(" [{r}]")).unwrap_or_default();
                 let style = latency_style(ms, self.threshold_ms);
-                (latency, format!("{sql_display}{rows_str}"), style)
+                (latency, Some(sql.clone()), rows_suffix, String::new(), style)
             }
             DisplayEventKind::Error { code, message, duration, .. } => {
                 let dur = duration
@@ -79,18 +117,20 @@ impl TuiApp {
                     .unwrap_or_default();
                 (
                     dur,
+                    None,
+                    String::new(),
                     format!("ERR {code}: {message}"),
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )
             }
             DisplayEventKind::ConnectionOpened => {
-                ("".into(), "++ connection opened".into(), Style::default().fg(Color::DarkGray))
+                ("".into(), None, String::new(), "++ connection opened".into(), Style::default().fg(Color::DarkGray))
             }
             DisplayEventKind::ConnectionClosed => {
-                ("".into(), "-- connection closed".into(), Style::default().fg(Color::DarkGray))
+                ("".into(), None, String::new(), "-- connection closed".into(), Style::default().fg(Color::DarkGray))
             }
             DisplayEventKind::Warning(msg) => {
-                ("".into(), format!("WARN: {msg}"), Style::default().fg(Color::Yellow))
+                ("".into(), None, String::new(), format!("WARN: {msg}"), Style::default().fg(Color::Yellow))
             }
         };
 
@@ -98,7 +138,9 @@ impl TuiApp {
             time,
             conn_id,
             latency,
-            sql,
+            raw_sql,
+            rows_suffix,
+            display,
             style,
         });
 
@@ -145,6 +187,15 @@ impl TuiApp {
             KeyCode::Char('p') => {
                 self.paused = !self.paused;
             }
+            KeyCode::Char('r') => {
+                self.stats.reset();
+                self.events.clear();
+                self.scroll_offset = 0;
+                self.auto_scroll = true;
+            }
+            KeyCode::Char('s') => {
+                self.save_snapshot();
+            }
             KeyCode::PageDown => {
                 self.auto_scroll = false;
                 self.scroll_offset = self.scroll_offset.saturating_add(20);
@@ -154,6 +205,75 @@ impl TuiApp {
                 self.scroll_offset = self.scroll_offset.saturating_sub(20);
             }
             _ => {}
+        }
+    }
+
+    fn save_snapshot(&mut self) {
+        let now = chrono::Local::now();
+        let filename = format!("dbprobe-{}.json", now.format("%Y%m%dT%H%M%S"));
+
+        let b = &self.stats.latency_buckets;
+        let snapshot = Snapshot {
+            timestamp: now.to_rfc3339(),
+            total_queries: self.stats.total_queries,
+            total_errors: self.stats.total_errors,
+            active_connections: self.stats.active_connections,
+            latency_buckets: LatencyBuckets {
+                under_1ms: b[0],
+                ms_1_5: b[1],
+                ms_5_10: b[2],
+                ms_10_50: b[3],
+                ms_50_100: b[4],
+                over_100ms: b[5],
+            },
+            top_queries: self.stats.top_queries(20).into_iter().map(|q| {
+                let avg_ms = if q.count > 0 {
+                    q.total_duration.as_secs_f64() * 1000.0 / q.count as f64
+                } else {
+                    0.0
+                };
+                SnapshotQuery {
+                    fingerprint: q.fingerprint,
+                    count: q.count,
+                    avg_ms,
+                    min_ms: q.min_duration.as_secs_f64() * 1000.0,
+                    max_ms: q.max_duration.as_secs_f64() * 1000.0,
+                }
+            }).collect(),
+            recent_events: self.events.iter().map(|row| {
+                let message = match &row.raw_sql {
+                    Some(sql) => format!("{sql}{}", row.rows_suffix),
+                    None => row.display.clone(),
+                };
+                SnapshotEvent {
+                    time: row.time.clone(),
+                    conn_id: row.conn_id,
+                    latency: row.latency.clone(),
+                    message,
+                }
+            }).collect(),
+        };
+
+        let message = match serde_json::to_string_pretty(&snapshot)
+            .map_err(io::Error::other)
+            .and_then(|json| std::fs::write(&filename, json))
+        {
+            Ok(()) => format!("Saved snapshot to {filename}"),
+            Err(e) => format!("Save failed: {e}"),
+        };
+
+        self.events.push_back(QueryRow {
+            time: now.format("%H:%M:%S%.3f").to_string(),
+            conn_id: 0,
+            latency: String::new(),
+            raw_sql: None,
+            rows_suffix: String::new(),
+            display: message,
+            style: Style::default().fg(Color::Cyan),
+        });
+
+        if self.auto_scroll {
+            self.scroll_to_bottom();
         }
     }
 
@@ -204,16 +324,24 @@ impl TuiApp {
         let visible_start = self.scroll_offset;
         let visible_end = (visible_start + inner_height).min(self.events.len());
 
+        let show_fp = self.show_fingerprints;
         let rows: Vec<Row> = self.events
             .iter()
             .skip(visible_start)
             .take(visible_end - visible_start)
             .map(|row| {
+                let text = match &row.raw_sql {
+                    Some(sql) => {
+                        let s = if show_fp { crate::fingerprint::fingerprint(sql) } else { sql.clone() };
+                        format!("{s}{}", row.rows_suffix)
+                    }
+                    None => row.display.clone(),
+                };
                 Row::new(vec![
                     Cell::from(row.time.clone()),
                     Cell::from(format!("{}", row.conn_id)),
                     Cell::from(row.latency.clone()),
-                    Cell::from(row.sql.clone()),
+                    Cell::from(text),
                 ])
                 .style(row.style)
             })
@@ -282,10 +410,10 @@ impl TuiApp {
     }
 
     fn draw_top_queries(&self, frame: &mut Frame, area: Rect) {
-        let top = self.stats.top_queries(6);
+        let top = self.stats.top_queries(5);
         let inner_width = area.width.saturating_sub(2) as usize;
 
-        let rows: Vec<Row> = top
+        let mut rows: Vec<Row> = top
             .iter()
             .map(|q: &QueryAggregates| {
                 let avg_ms = if q.count > 0 {
@@ -306,6 +434,24 @@ impl TuiApp {
                 ])
             })
             .collect();
+
+        // Total row
+        if self.stats.total_queries > 0 {
+            let total_count: u64 = self.stats.total_queries;
+            let total_dur: Duration = self.stats.fingerprints.values()
+                .map(|q| q.total_duration)
+                .sum();
+            let total_avg = total_dur.as_secs_f64() * 1000.0 / total_count as f64;
+            let unique = self.stats.fingerprints.len();
+            rows.push(
+                Row::new(vec![
+                    Cell::from(format!("TOTAL ({unique} unique)")),
+                    Cell::from(format!("{total_count}")),
+                    Cell::from(format!("{total_avg:.1}ms")),
+                ])
+                .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))
+            );
+        }
 
         let table = Table::new(
             rows,
@@ -329,7 +475,7 @@ impl TuiApp {
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
-        let help = " q:quit  j/k:scroll  G:bottom  g:top  f:fingerprint  p:pause ";
+        let help = " q:quit  j/k:scroll  G:bottom  g:top  f:fingerprint  p:pause  r:reset  s:save ";
         let style = Style::default().fg(Color::DarkGray);
         let para = Paragraph::new(help).style(style);
         frame.render_widget(para, area);
@@ -358,7 +504,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
 /// Run the TUI. This takes over the terminal.
 /// Receives ProxyMessages via the channel, processes stats internally.
 pub async fn run_tui(
-    mut rx: mpsc::Receiver<ProxyMessage>,
+    mut rx: mpsc::UnboundedReceiver<ProxyMessage>,
     listen_port: u16,
     upstream: String,
     threshold_ms: u64,
@@ -379,7 +525,7 @@ pub async fn run_tui(
 
 async fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    rx: &mut mpsc::Receiver<ProxyMessage>,
+    rx: &mut mpsc::UnboundedReceiver<ProxyMessage>,
     listen_port: u16,
     upstream: String,
     threshold_ms: u64,

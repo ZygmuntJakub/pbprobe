@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
+
 use crate::fingerprint::fingerprint;
 use crate::output::{DisplayEvent, DisplayEventKind};
 use crate::protocol::{ProtoEvent, TxStatus};
@@ -25,7 +27,7 @@ struct PendingQuery {
     started_at: Instant,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct QueryAggregates {
     pub fingerprint: String,
     pub count: u64,
@@ -45,6 +47,16 @@ impl StatsCollector {
             active_connections: 0,
             qps_window: VecDeque::new(),
         }
+    }
+
+    /// Reset all accumulated stats for a fresh measurement window.
+    /// Keeps connections and active_connections intact (live state).
+    pub fn reset(&mut self) {
+        self.fingerprints.clear();
+        self.latency_buckets = [0; 6];
+        self.total_queries = 0;
+        self.total_errors = 0;
+        self.qps_window.clear();
     }
 
     pub fn process_event(&mut self, conn_id: u64, event: ProtoEvent) -> Option<DisplayEvent> {

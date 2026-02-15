@@ -29,7 +29,7 @@ static CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub async fn run_proxy(
     listen_addr: &str,
     upstream_addr: String,
-    tx: mpsc::Sender<ProxyMessage>,
+    tx: mpsc::UnboundedSender<ProxyMessage>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(listen_addr).await?;
     info!("Listening on {listen_addr}, forwarding to {upstream_addr}");
@@ -41,13 +41,13 @@ pub async fn run_proxy(
         let tx = tx.clone();
 
         debug!("New connection {conn_id} from {client_addr}");
-        let _ = tx.send(ProxyMessage::ConnectionOpened { conn_id }).await;
+        let _ = tx.send(ProxyMessage::ConnectionOpened { conn_id });
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(conn_id, client_stream, &upstream_addr, tx.clone()).await {
                 warn!("Connection {conn_id} error: {e}");
             }
-            let _ = tx.send(ProxyMessage::ConnectionClosed { conn_id }).await;
+            let _ = tx.send(ProxyMessage::ConnectionClosed { conn_id });
             debug!("Connection {conn_id} closed");
         });
     }
@@ -57,7 +57,7 @@ async fn handle_connection(
     conn_id: u64,
     client_stream: TcpStream,
     upstream_addr: &str,
-    tx: mpsc::Sender<ProxyMessage>,
+    tx: mpsc::UnboundedSender<ProxyMessage>,
 ) -> anyhow::Result<()> {
     let upstream_stream = match tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -152,7 +152,7 @@ async fn relay_frontend(
     mut reader: OwnedReadHalf,
     mut writer: OwnedWriteHalf,
     parser: Arc<Mutex<Box<dyn ProtocolParser>>>,
-    events_tx: mpsc::Sender<ProxyMessage>,
+    events_tx: mpsc::UnboundedSender<ProxyMessage>,
     conn_id: u64,
     intercept_tx: mpsc::Sender<Vec<u8>>,
 ) -> anyhow::Result<()> {
@@ -193,21 +193,22 @@ async fn relay_frontend(
             writer.write_all(&buf[..n]).await?;
         }
 
-        // Parse events from buffer.
-        // Collect events under the lock, then send them after releasing it.
+        // Parse events from buffer — collect under lock, send after release.
+        // Unknown events are filtered: they are discarded by stats and would
+        // unnecessarily grow the unbounded channel during large pipelines.
         let events: Vec<ProtoEvent> = {
             let mut parser = parser.lock().unwrap();
             let mut collected = Vec::new();
             while let Some((event, consumed)) = parser.try_parse(&parse_buf, Direction::Frontend) {
-                collected.push(event);
+                if !matches!(event, ProtoEvent::Unknown { .. }) {
+                    collected.push(event);
+                }
                 let _ = parse_buf.split_to(consumed);
             }
             collected
         };
         for event in events {
-            let _ = events_tx
-                .send(ProxyMessage::Event { conn_id, event })
-                .await;
+            let _ = events_tx.send(ProxyMessage::Event { conn_id, event });
         }
     }
 
@@ -218,7 +219,7 @@ async fn relay_backend(
     mut reader: OwnedReadHalf,
     writer_tx: mpsc::Sender<Bytes>,
     parser: Arc<Mutex<Box<dyn ProtocolParser>>>,
-    events_tx: mpsc::Sender<ProxyMessage>,
+    events_tx: mpsc::UnboundedSender<ProxyMessage>,
     conn_id: u64,
 ) -> anyhow::Result<()> {
     let mut buf = vec![0u8; 16384];
@@ -241,15 +242,15 @@ async fn relay_backend(
             let mut parser = parser.lock().unwrap();
             let mut collected = Vec::new();
             while let Some((event, consumed)) = parser.try_parse(&parse_buf, Direction::Backend) {
-                collected.push(event);
+                if !matches!(event, ProtoEvent::Unknown { .. }) {
+                    collected.push(event);
+                }
                 let _ = parse_buf.split_to(consumed);
             }
             collected
         };
         for event in events {
-            let _ = events_tx
-                .send(ProxyMessage::Event { conn_id, event })
-                .await;
+            let _ = events_tx.send(ProxyMessage::Event { conn_id, event });
         }
     }
 
