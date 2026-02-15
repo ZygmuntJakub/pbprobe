@@ -22,6 +22,10 @@ app :5433 ──→ dbprobe ──→ postgres :5432
 
 Zero database extensions. Zero config changes. Just point your app at a different port.
 
+<p align="center">
+  <video src="https://github.com/user-attachments/assets/eea2e540-dd0b-4b3d-840b-d1b687d5667c" width="800" autoplay loop muted playsinline></video>
+</p>
+
 ## Features
 
 - **Transparent proxy** — forward-first architecture; parsing never adds latency to your queries
@@ -94,39 +98,6 @@ Options:
   -m, --mode <MODE>          Output mode: tui or raw [default: auto-detect]
   -t, --threshold <MS>       Highlight queries slower than this [default: 100]
   -h, --help                 Print help
-```
-
-## TUI Dashboard
-
-The dashboard has four sections:
-
-| Section | Description |
-|---------|-------------|
-| **Header** | Port, upstream, active connections, QPS, total queries, errors |
-| **Query log** | Scrollable table of every query with time, connection, latency, SQL |
-| **Latency histogram** | Bar chart across 6 latency buckets |
-| **Top queries** | Fingerprinted queries sorted by total time with count and average |
-
-### Keybindings
-
-| Key | Action |
-|-----|--------|
-| `q` / `Ctrl-C` | Quit |
-| `j` / `k` / `Up` / `Down` | Scroll query log |
-| `PgUp` / `PgDn` | Scroll by page |
-| `g` / `Home` | Jump to top |
-| `G` / `End` | Jump to bottom (re-enable auto-scroll) |
-| `f` | Toggle fingerprint view (normalize SQL) |
-| `p` | Pause / resume event stream |
-
-### Raw Mode Output
-
-```
-14:23:01.456 [conn:1]      0.8ms  SELECT * FROM users WHERE id = 42 [1 rows]
-14:23:01.458 [conn:1]     23.5ms  UPDATE orders SET status = 'shipped' WHERE id = 99 [1 rows]
-14:23:01.461 [conn:2]    156.2ms  SELECT * FROM products JOIN categories... [342 rows]
-14:23:01.462 [conn:1]      1.2ms  COMMIT
-14:23:01.500 [conn:3]            ERR 42P01: relation "nonexistent" does not exist
 ```
 
 ## How It Works
