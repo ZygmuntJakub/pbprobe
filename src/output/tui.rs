@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -56,6 +56,7 @@ const MAX_EVENTS: usize = 10_000;
 
 struct QueryRow {
     time: String,
+    instant: Instant,
     conn_id: u64,
     latency: String,
     /// Raw SQL for query events (used for fingerprint toggle), None for non-query rows.
@@ -136,6 +137,7 @@ impl TuiApp {
 
         self.events.push_back(QueryRow {
             time,
+            instant: Instant::now(),
             conn_id,
             latency,
             raw_sql,
@@ -264,6 +266,7 @@ impl TuiApp {
 
         self.events.push_back(QueryRow {
             time: now.format("%H:%M:%S%.3f").to_string(),
+            instant: Instant::now(),
             conn_id: 0,
             latency: String::new(),
             raw_sql: None,
@@ -325,6 +328,7 @@ impl TuiApp {
         let visible_end = (visible_start + inner_height).min(self.events.len());
 
         let show_fp = self.show_fingerprints;
+        let first_instant = self.stats.first_query_at;
         let rows: Vec<Row> = self.events
             .iter()
             .skip(visible_start)
@@ -337,10 +341,22 @@ impl TuiApp {
                     }
                     None => row.display.clone(),
                 };
+                let elapsed = first_instant
+                    .and_then(|f| row.instant.checked_duration_since(f))
+                    .map(|d| {
+                        let ms = d.as_millis();
+                        if ms < 10_000 {
+                            format!("{ms}ms")
+                        } else {
+                            format!("{:.1}s", d.as_secs_f64())
+                        }
+                    })
+                    .unwrap_or_default();
                 Row::new(vec![
                     Cell::from(row.time.clone()),
                     Cell::from(format!("{}", row.conn_id)),
                     Cell::from(row.latency.clone()),
+                    Cell::from(elapsed),
                     Cell::from(text),
                 ])
                 .style(row.style)
@@ -359,11 +375,12 @@ impl TuiApp {
                 Constraint::Length(12),
                 Constraint::Length(5),
                 Constraint::Length(10),
+                Constraint::Length(8),
                 Constraint::Min(30),
             ],
         )
         .header(
-            Row::new(vec!["TIME", "CONN", "LATENCY", "QUERY"])
+            Row::new(vec!["TIME", "CONN", "LATENCY", "ELAPSED", "QUERY"])
                 .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan))
         )
         .block(

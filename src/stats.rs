@@ -15,6 +15,8 @@ pub struct StatsCollector {
     pub total_errors: u64,
     pub active_connections: u64,
     qps_window: VecDeque<Instant>,
+    pub first_query_at: Option<Instant>,
+    pub last_query_at: Option<Instant>,
 }
 
 struct ConnState {
@@ -46,6 +48,8 @@ impl StatsCollector {
             total_errors: 0,
             active_connections: 0,
             qps_window: VecDeque::new(),
+            first_query_at: None,
+            last_query_at: None,
         }
     }
 
@@ -57,6 +61,8 @@ impl StatsCollector {
         self.total_queries = 0;
         self.total_errors = 0;
         self.qps_window.clear();
+        self.first_query_at = None;
+        self.last_query_at = None;
     }
 
     pub fn process_event(&mut self, conn_id: u64, event: ProtoEvent) -> Option<DisplayEvent> {
@@ -91,6 +97,10 @@ impl StatsCollector {
                 let duration = now - pending.started_at;
 
                 self.total_queries += 1;
+                if self.first_query_at.is_none() {
+                    self.first_query_at = Some(now);
+                }
+                self.last_query_at = Some(now);
                 self.record_latency(duration);
                 self.record_fingerprint(&pending.sql, duration);
                 self.qps_window.push_back(now);
