@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::proxy::ProxyMessage;
-use crate::stats::{QueryAggregates, StatsCollector};
+use crate::stats::{FrozenStats, QueryAggregates, StatsCollector};
 use super::{DisplayEvent, DisplayEventKind};
 
 #[derive(Serialize)]
@@ -54,6 +54,7 @@ struct SnapshotEvent {
 
 const MAX_EVENTS: usize = 10_000;
 
+#[derive(Clone)]
 struct QueryRow {
     time: String,
     instant: Instant,
@@ -67,6 +68,31 @@ struct QueryRow {
     style: Style,
 }
 
+struct FrozenTab {
+    label: String,
+    events: VecDeque<QueryRow>,
+    stats: FrozenStats,
+    scroll_offset: usize,
+    auto_scroll: bool,
+    show_fingerprints: bool,
+}
+
+/// Shared context for draw methods — abstracts over live and frozen tabs.
+struct DrawContext<'a> {
+    events: &'a VecDeque<QueryRow>,
+    fingerprints: &'a HashMap<String, QueryAggregates>,
+    latency_buckets: &'a [u64; 6],
+    total_queries: u64,
+    total_errors: u64,
+    active_connections: u64,
+    first_query_at: Option<Instant>,
+    scroll_offset: &'a mut usize,
+    auto_scroll: bool,
+    show_fingerprints: bool,
+    is_frozen: bool,
+    qps: Option<u64>,
+}
+
 pub struct TuiApp {
     events: VecDeque<QueryRow>,
     stats: StatsCollector,
@@ -78,6 +104,10 @@ pub struct TuiApp {
     upstream: String,
     threshold_ms: u64,
     should_quit: bool,
+    frozen_tabs: Vec<FrozenTab>,
+    /// 0 = live tab, 1+ = frozen_tabs[active_tab - 1]
+    active_tab: usize,
+    next_tab_id: usize,
 }
 
 impl TuiApp {
@@ -93,6 +123,9 @@ impl TuiApp {
             upstream,
             threshold_ms,
             should_quit: false,
+            frozen_tabs: Vec::new(),
+            active_tab: 0,
+            next_tab_id: 1,
         }
     }
 
@@ -163,48 +196,128 @@ impl TuiApp {
         self.scroll_offset = usize::MAX;
     }
 
+    // --- Tab lifecycle ---
+
+    fn create_tab(&mut self) {
+        let label = format!("Tab {}", self.next_tab_id);
+        self.next_tab_id += 1;
+        self.frozen_tabs.push(FrozenTab {
+            label,
+            events: self.events.clone(),
+            stats: self.stats.freeze(),
+            scroll_offset: self.scroll_offset,
+            auto_scroll: self.auto_scroll,
+            show_fingerprints: self.show_fingerprints,
+        });
+        // Stay on live tab — state kept; user can reset with 'r'
+        self.active_tab = 0;
+    }
+
+    fn close_tab(&mut self) {
+        if self.active_tab == 0 {
+            return; // Can't close live tab
+        }
+        let idx = self.active_tab - 1;
+        self.frozen_tabs.remove(idx);
+        // If we were on the last frozen tab, move back
+        if self.active_tab > self.frozen_tabs.len() {
+            self.active_tab = self.frozen_tabs.len(); // last frozen, or 0 (live) if none left
+        }
+    }
+
+    fn next_tab(&mut self) {
+        let total = 1 + self.frozen_tabs.len(); // live + frozen
+        self.active_tab = (self.active_tab + 1) % total;
+    }
+
+    fn prev_tab(&mut self) {
+        let total = 1 + self.frozen_tabs.len();
+        self.active_tab = (self.active_tab + total - 1) % total;
+    }
+
+    /// Returns mutable refs to (scroll_offset, auto_scroll, show_fingerprints)
+    /// for the active tab — either live state or a frozen tab.
+    fn active_scroll_state(&mut self) -> (&mut usize, &mut bool, &mut bool) {
+        if self.active_tab == 0 {
+            (&mut self.scroll_offset, &mut self.auto_scroll, &mut self.show_fingerprints)
+        } else {
+            let tab = &mut self.frozen_tabs[self.active_tab - 1];
+            (&mut tab.scroll_offset, &mut tab.auto_scroll, &mut tab.show_fingerprints)
+        }
+    }
+
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => self.should_quit = true,
+
+            // Tab management
+            KeyCode::Char('t') => self.create_tab(),
+            KeyCode::Tab => self.next_tab(),
+            KeyCode::BackTab => self.prev_tab(),
+            KeyCode::Char('x') => self.close_tab(),
+            KeyCode::Char(c @ '1'..='9') => {
+                let n = (c as usize) - ('1' as usize); // 0-indexed: '1'->0 (live), '2'->1 (first frozen), etc.
+                let total = 1 + self.frozen_tabs.len();
+                if n < total {
+                    self.active_tab = n;
+                }
+            }
+
+            // Scroll keys — operate on active tab
             KeyCode::Char('j') | KeyCode::Down => {
-                self.auto_scroll = false;
-                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                let (offset, auto_scroll, _) = self.active_scroll_state();
+                *auto_scroll = false;
+                *offset = offset.saturating_add(1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.auto_scroll = false;
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                let (offset, auto_scroll, _) = self.active_scroll_state();
+                *auto_scroll = false;
+                *offset = offset.saturating_sub(1);
             }
             KeyCode::Char('G') | KeyCode::End => {
-                self.auto_scroll = true;
-                self.scroll_to_bottom();
+                let (offset, auto_scroll, _) = self.active_scroll_state();
+                *auto_scroll = true;
+                *offset = usize::MAX;
             }
             KeyCode::Char('g') | KeyCode::Home => {
-                self.auto_scroll = false;
-                self.scroll_offset = 0;
+                let (offset, auto_scroll, _) = self.active_scroll_state();
+                *auto_scroll = false;
+                *offset = 0;
             }
+            KeyCode::PageDown => {
+                let (offset, auto_scroll, _) = self.active_scroll_state();
+                *auto_scroll = false;
+                *offset = offset.saturating_add(20);
+            }
+            KeyCode::PageUp => {
+                let (offset, auto_scroll, _) = self.active_scroll_state();
+                *auto_scroll = false;
+                *offset = offset.saturating_sub(20);
+            }
+
+            // Fingerprint toggle — operates on active tab
             KeyCode::Char('f') => {
-                self.show_fingerprints = !self.show_fingerprints;
+                let (_, _, show_fp) = self.active_scroll_state();
+                *show_fp = !*show_fp;
             }
+
+            // Pause and reset — live tab only
             KeyCode::Char('p') => {
-                self.paused = !self.paused;
+                if self.active_tab == 0 {
+                    self.paused = !self.paused;
+                }
             }
             KeyCode::Char('r') => {
-                self.stats.reset();
-                self.events.clear();
-                self.scroll_offset = 0;
-                self.auto_scroll = true;
+                if self.active_tab == 0 {
+                    self.stats.reset();
+                    self.events.clear();
+                    self.scroll_offset = 0;
+                    self.auto_scroll = true;
+                }
             }
             KeyCode::Char('s') => {
                 self.save_snapshot();
-            }
-            KeyCode::PageDown => {
-                self.auto_scroll = false;
-                self.scroll_offset = self.scroll_offset.saturating_add(20);
-            }
-            KeyCode::PageUp => {
-                self.auto_scroll = false;
-                self.scroll_offset = self.scroll_offset.saturating_sub(20);
             }
             _ => {}
         }
@@ -214,21 +327,44 @@ impl TuiApp {
         let now = chrono::Local::now();
         let filename = format!("dbprobe-{}.json", now.format("%Y%m%dT%H%M%S"));
 
-        let b = &self.stats.latency_buckets;
+        // Build snapshot from active tab's data
+        let (buckets, total_queries, total_errors, active_connections, top_queries, events) =
+            if self.active_tab == 0 {
+                (
+                    &self.stats.latency_buckets,
+                    self.stats.total_queries,
+                    self.stats.total_errors,
+                    self.stats.active_connections,
+                    self.stats.top_queries(20),
+                    &self.events,
+                )
+            } else if let Some(tab) = self.frozen_tabs.get(self.active_tab - 1) {
+                (
+                    &tab.stats.latency_buckets,
+                    tab.stats.total_queries,
+                    tab.stats.total_errors,
+                    tab.stats.active_connections,
+                    tab.stats.top_queries(20),
+                    &tab.events,
+                )
+            } else {
+                return;
+            };
+
         let snapshot = Snapshot {
             timestamp: now.to_rfc3339(),
-            total_queries: self.stats.total_queries,
-            total_errors: self.stats.total_errors,
-            active_connections: self.stats.active_connections,
+            total_queries,
+            total_errors,
+            active_connections,
             latency_buckets: LatencyBuckets {
-                under_1ms: b[0],
-                ms_1_5: b[1],
-                ms_5_10: b[2],
-                ms_10_50: b[3],
-                ms_50_100: b[4],
-                over_100ms: b[5],
+                under_1ms: buckets[0],
+                ms_1_5: buckets[1],
+                ms_5_10: buckets[2],
+                ms_10_50: buckets[3],
+                ms_50_100: buckets[4],
+                over_100ms: buckets[5],
             },
-            top_queries: self.stats.top_queries(20).into_iter().map(|q| {
+            top_queries: top_queries.into_iter().map(|q| {
                 let avg_ms = if q.count > 0 {
                     q.total_duration.as_secs_f64() * 1000.0 / q.count as f64
                 } else {
@@ -242,7 +378,7 @@ impl TuiApp {
                     max_ms: q.max_duration.as_secs_f64() * 1000.0,
                 }
             }).collect(),
-            recent_events: self.events.iter().map(|row| {
+            recent_events: events.iter().map(|row| {
                 let message = match &row.raw_sql {
                     Some(sql) => format!("{sql}{}", row.rows_suffix),
                     None => row.display.clone(),
@@ -282,32 +418,106 @@ impl TuiApp {
 
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
+        let has_tabs = !self.frozen_tabs.is_empty();
 
-        // Layout: header(1) + query table (flex) + bottom panels (11) + footer(1)
-        let main_chunks = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(10),
-            Constraint::Length(11),
-            Constraint::Length(1),
-        ])
-        .split(area);
+        // Layout: [tab_bar(1)?] + header(1) + query table (flex) + bottom panels (11) + footer(1)
+        let main_chunks = if has_tabs {
+            Layout::vertical([
+                Constraint::Length(1), // tab bar
+                Constraint::Length(1), // header
+                Constraint::Min(10),   // query table
+                Constraint::Length(11), // bottom panels
+                Constraint::Length(1), // footer
+            ])
+            .split(area)
+        } else {
+            Layout::vertical([
+                Constraint::Length(0), // no tab bar
+                Constraint::Length(1),
+                Constraint::Min(10),
+                Constraint::Length(11),
+                Constraint::Length(1),
+            ])
+            .split(area)
+        };
 
-        self.draw_header(frame, main_chunks[0]);
-        self.draw_query_table(frame, main_chunks[1]);
-        self.draw_bottom_panels(frame, main_chunks[2]);
-        self.draw_footer(frame, main_chunks[3]);
+        if has_tabs {
+            self.draw_tab_bar(frame, main_chunks[0]);
+        }
+
+        // Build DrawContext for the active tab
+        if self.active_tab == 0 {
+            let qps = self.stats.qps();
+            let mut ctx = DrawContext {
+                events: &self.events,
+                fingerprints: &self.stats.fingerprints,
+                latency_buckets: &self.stats.latency_buckets,
+                total_queries: self.stats.total_queries,
+                total_errors: self.stats.total_errors,
+                active_connections: self.stats.active_connections,
+                first_query_at: self.stats.first_query_at,
+                scroll_offset: &mut self.scroll_offset,
+                auto_scroll: self.auto_scroll,
+                show_fingerprints: self.show_fingerprints,
+                is_frozen: false,
+                qps: Some(qps),
+            };
+            Self::draw_header_ctx(frame, main_chunks[1], &ctx, self.listen_port, &self.upstream, self.paused);
+            Self::draw_query_table_ctx(frame, main_chunks[2], &mut ctx);
+            Self::draw_bottom_panels_ctx(frame, main_chunks[3], &ctx);
+        } else if let Some(tab) = self.frozen_tabs.get_mut(self.active_tab - 1) {
+            let mut ctx = DrawContext {
+                events: &tab.events,
+                fingerprints: &tab.stats.fingerprints,
+                latency_buckets: &tab.stats.latency_buckets,
+                total_queries: tab.stats.total_queries,
+                total_errors: tab.stats.total_errors,
+                active_connections: tab.stats.active_connections,
+                first_query_at: tab.stats.first_query_at,
+                scroll_offset: &mut tab.scroll_offset,
+                auto_scroll: tab.auto_scroll,
+                show_fingerprints: tab.show_fingerprints,
+                is_frozen: true,
+                qps: None,
+            };
+            Self::draw_header_ctx(frame, main_chunks[1], &ctx, self.listen_port, &self.upstream, false);
+            Self::draw_query_table_ctx(frame, main_chunks[2], &mut ctx);
+            Self::draw_bottom_panels_ctx(frame, main_chunks[3], &ctx);
+        }
+
+        self.draw_footer(frame, main_chunks[4]);
     }
 
-    fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
-        let qps = self.stats.qps();
-        let conns = self.stats.active_connections;
-        let errs = self.stats.total_errors;
-        let total = self.stats.total_queries;
-        let paused = if self.paused { " [PAUSED]" } else { "" };
+    fn draw_tab_bar(&self, frame: &mut Frame, area: Rect) {
+        let active = Style::default().bg(Color::White).fg(Color::Black).add_modifier(Modifier::BOLD);
+        let inactive = Style::default().fg(Color::DarkGray);
+
+        let mut spans = vec![Span::styled(
+            " Live ",
+            if self.active_tab == 0 { active } else { inactive },
+        )];
+
+        for (idx, tab) in self.frozen_tabs.iter().enumerate() {
+            spans.push(Span::raw(" "));
+            let style = if self.active_tab == idx + 1 { active } else { inactive };
+            spans.push(Span::styled(format!(" {} ", tab.label), style));
+        }
+
+        spans.push(Span::styled("    Tab:switch  x:close", inactive));
+
+        let para = Paragraph::new(Line::from(spans));
+        frame.render_widget(para, area);
+    }
+
+    fn draw_header_ctx(frame: &mut Frame, area: Rect, ctx: &DrawContext, listen_port: u16, upstream: &str, paused: bool) {
+        let qps_str = ctx.qps.map(|q| format!("{q}")).unwrap_or_else(|| "—".into());
+        let frozen_str = if ctx.is_frozen { " [FROZEN]" } else { "" };
+        let paused_str = if paused { " [PAUSED]" } else { "" };
 
         let header = format!(
-            " dbprobe ── :{} → {} ── conns: {} ── qps: {} ── total: {} ── errs: {}{} ",
-            self.listen_port, self.upstream, conns, qps, total, errs, paused,
+            " dbprobe ── :{} → {} ── conns: {} ── qps: {} ── total: {} ── errs: {}{}{} ",
+            listen_port, upstream, ctx.active_connections, qps_str,
+            ctx.total_queries, ctx.total_errors, frozen_str, paused_str,
         );
 
         let style = Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD);
@@ -315,21 +525,21 @@ impl TuiApp {
         frame.render_widget(para, area);
     }
 
-    fn draw_query_table(&mut self, frame: &mut Frame, area: Rect) {
+    fn draw_query_table_ctx(frame: &mut Frame, area: Rect, ctx: &mut DrawContext) {
         let inner_height = area.height.saturating_sub(2) as usize; // borders
 
         // Clamp scroll offset
-        let max_scroll = self.events.len().saturating_sub(inner_height);
-        if self.scroll_offset > max_scroll {
-            self.scroll_offset = max_scroll;
+        let max_scroll = ctx.events.len().saturating_sub(inner_height);
+        if *ctx.scroll_offset > max_scroll {
+            *ctx.scroll_offset = max_scroll;
         }
 
-        let visible_start = self.scroll_offset;
-        let visible_end = (visible_start + inner_height).min(self.events.len());
+        let visible_start = *ctx.scroll_offset;
+        let visible_end = (visible_start + inner_height).min(ctx.events.len());
 
-        let show_fp = self.show_fingerprints;
-        let first_instant = self.stats.first_query_at;
-        let rows: Vec<Row> = self.events
+        let show_fp = ctx.show_fingerprints;
+        let first_instant = ctx.first_query_at;
+        let rows: Vec<Row> = ctx.events
             .iter()
             .skip(visible_start)
             .take(visible_end - visible_start)
@@ -363,10 +573,10 @@ impl TuiApp {
             })
             .collect();
 
-        let scroll_indicator = if self.auto_scroll {
-            "AUTO"
+        let scroll_indicator = if ctx.auto_scroll {
+            "AUTO".to_string()
         } else {
-            &format!("{}/{}", self.scroll_offset + inner_height, self.events.len())
+            format!("{}/{}", *ctx.scroll_offset + inner_height, ctx.events.len())
         };
 
         let table = Table::new(
@@ -392,22 +602,22 @@ impl TuiApp {
         frame.render_widget(table, area);
     }
 
-    fn draw_bottom_panels(&self, frame: &mut Frame, area: Rect) {
+    fn draw_bottom_panels_ctx(frame: &mut Frame, area: Rect, ctx: &DrawContext) {
         let chunks = Layout::horizontal([
             Constraint::Percentage(40),
             Constraint::Percentage(60),
         ])
         .split(area);
 
-        self.draw_latency_histogram(frame, chunks[0]);
-        self.draw_top_queries(frame, chunks[1]);
+        Self::draw_latency_histogram_ctx(frame, chunks[0], ctx);
+        Self::draw_top_queries_ctx(frame, chunks[1], ctx);
     }
 
-    fn draw_latency_histogram(&self, frame: &mut Frame, area: Rect) {
+    fn draw_latency_histogram_ctx(frame: &mut Frame, area: Rect, ctx: &DrawContext) {
         let labels = ["<1ms", "1-5ms", "5-10ms", "10-50ms", "50-100ms", ">100ms"];
         let data: Vec<(&str, u64)> = labels
             .iter()
-            .zip(self.stats.latency_buckets.iter())
+            .zip(ctx.latency_buckets.iter())
             .map(|(&label, &count)| (label, count))
             .collect();
 
@@ -426,8 +636,10 @@ impl TuiApp {
         frame.render_widget(chart, area);
     }
 
-    fn draw_top_queries(&self, frame: &mut Frame, area: Rect) {
-        let top = self.stats.top_queries(5);
+    fn draw_top_queries_ctx(frame: &mut Frame, area: Rect, ctx: &DrawContext) {
+        let mut top: Vec<_> = ctx.fingerprints.values().cloned().collect();
+        top.sort_unstable_by(|a, b| b.total_duration.cmp(&a.total_duration));
+        top.truncate(5);
         let inner_width = area.width.saturating_sub(2) as usize;
 
         let mut rows: Vec<Row> = top
@@ -453,13 +665,13 @@ impl TuiApp {
             .collect();
 
         // Total row
-        if self.stats.total_queries > 0 {
-            let total_count: u64 = self.stats.total_queries;
-            let total_dur: Duration = self.stats.fingerprints.values()
+        if ctx.total_queries > 0 {
+            let total_count = ctx.total_queries;
+            let total_dur: Duration = ctx.fingerprints.values()
                 .map(|q| q.total_duration)
                 .sum();
             let total_avg = total_dur.as_secs_f64() * 1000.0 / total_count as f64;
-            let unique = self.stats.fingerprints.len();
+            let unique = ctx.fingerprints.len();
             rows.push(
                 Row::new(vec![
                     Cell::from(format!("TOTAL ({unique} unique)")),
@@ -492,7 +704,11 @@ impl TuiApp {
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
-        let help = " q:quit  j/k:scroll  G:bottom  g:top  f:fingerprint  p:pause  r:reset  s:save ";
+        let help = if self.frozen_tabs.is_empty() {
+            " q:quit  j/k:scroll  G:bottom  g:top  f:fingerprint  p:pause  r:reset  s:save  t:new-tab ".to_string()
+        } else {
+            " q:quit  j/k:scroll  G:bottom  g:top  f:fingerprint  p:pause  r:reset  s:save  t:new-tab  Tab:switch  x:close ".to_string()
+        };
         let style = Style::default().fg(Color::DarkGray);
         let para = Paragraph::new(help).style(style);
         frame.render_widget(para, area);

@@ -240,6 +240,36 @@ impl StatsCollector {
         queries.truncate(n);
         queries
     }
+
+    pub fn freeze(&self) -> FrozenStats {
+        FrozenStats {
+            fingerprints: self.fingerprints.clone(),
+            latency_buckets: self.latency_buckets,
+            total_queries: self.total_queries,
+            total_errors: self.total_errors,
+            active_connections: self.active_connections,
+            first_query_at: self.first_query_at,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct FrozenStats {
+    pub fingerprints: HashMap<String, QueryAggregates>,
+    pub latency_buckets: [u64; 6],
+    pub total_queries: u64,
+    pub total_errors: u64,
+    pub active_connections: u64,
+    pub first_query_at: Option<Instant>,
+}
+
+impl FrozenStats {
+    pub fn top_queries(&self, n: usize) -> Vec<QueryAggregates> {
+        let mut queries: Vec<_> = self.fingerprints.values().cloned().collect();
+        queries.sort_unstable_by(|a, b| b.total_duration.cmp(&a.total_duration));
+        queries.truncate(n);
+        queries
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
