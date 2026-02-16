@@ -7,14 +7,14 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, BarChart};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::proxy::ProxyMessage;
 use crate::stats::{FrozenStats, QueryAggregates, StatsCollector};
 use super::{DisplayEvent, DisplayEventKind};
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Snapshot {
     timestamp: String,
     total_queries: u64,
@@ -25,7 +25,7 @@ struct Snapshot {
     recent_events: Vec<SnapshotEvent>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct LatencyBuckets {
     under_1ms: u64,
     ms_1_5: u64,
@@ -35,7 +35,7 @@ struct LatencyBuckets {
     over_100ms: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct SnapshotQuery {
     fingerprint: String,
     count: u64,
@@ -44,7 +44,7 @@ struct SnapshotQuery {
     max_ms: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct SnapshotEvent {
     time: String,
     conn_id: u64,
@@ -93,6 +93,12 @@ struct DrawContext<'a> {
     qps: Option<u64>,
 }
 
+enum InputMode {
+    Normal,
+    SavePrompt { buffer: String, cursor: usize },
+    ImportPrompt { buffer: String, cursor: usize },
+}
+
 pub struct TuiApp {
     events: VecDeque<QueryRow>,
     stats: StatsCollector,
@@ -108,6 +114,7 @@ pub struct TuiApp {
     /// 0 = live tab, 1+ = frozen_tabs[active_tab - 1]
     active_tab: usize,
     next_tab_id: usize,
+    input_mode: InputMode,
 }
 
 impl TuiApp {
@@ -126,6 +133,7 @@ impl TuiApp {
             frozen_tabs: Vec::new(),
             active_tab: 0,
             next_tab_id: 1,
+            input_mode: InputMode::Normal,
         }
     }
 
@@ -247,6 +255,11 @@ impl TuiApp {
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        if !matches!(self.input_mode, InputMode::Normal) {
+            self.handle_input_key(code);
+            return;
+        }
+
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => self.should_quit = true,
@@ -257,7 +270,7 @@ impl TuiApp {
             KeyCode::BackTab => self.prev_tab(),
             KeyCode::Char('x') => self.close_tab(),
             KeyCode::Char(c @ '1'..='9') => {
-                let n = (c as usize) - ('1' as usize); // 0-indexed: '1'->0 (live), '2'->1 (first frozen), etc.
+                let n = (c as usize) - ('1' as usize);
                 let total = 1 + self.frozen_tabs.len();
                 if n < total {
                     self.active_tab = n;
@@ -317,15 +330,82 @@ impl TuiApp {
                 }
             }
             KeyCode::Char('s') => {
-                self.save_snapshot();
+                let default = format!("dbprobe-{}.json", chrono::Local::now().format("%Y%m%dT%H%M%S"));
+                let cursor = default.len();
+                self.input_mode = InputMode::SavePrompt { buffer: default, cursor };
+            }
+            KeyCode::Char('i') => {
+                self.input_mode = InputMode::ImportPrompt { buffer: String::new(), cursor: 0 };
             }
             _ => {}
         }
     }
 
-    fn save_snapshot(&mut self) {
+    fn handle_input_key(&mut self, code: KeyCode) {
+        let (buffer, cursor) = match &mut self.input_mode {
+            InputMode::SavePrompt { buffer, cursor } |
+            InputMode::ImportPrompt { buffer, cursor } => (buffer, cursor),
+            InputMode::Normal => return,
+        };
+
+        match code {
+            KeyCode::Char(c) => {
+                buffer.insert(*cursor, c);
+                *cursor += c.len_utf8();
+            }
+            KeyCode::Backspace => {
+                if *cursor > 0 {
+                    // Find previous char boundary
+                    let mut new_cursor = *cursor - 1;
+                    while new_cursor > 0 && !buffer.is_char_boundary(new_cursor) {
+                        new_cursor -= 1;
+                    }
+                    buffer.drain(new_cursor..*cursor);
+                    *cursor = new_cursor;
+                }
+            }
+            KeyCode::Left => {
+                if *cursor > 0 {
+                    *cursor -= 1;
+                    while *cursor > 0 && !buffer.is_char_boundary(*cursor) {
+                        *cursor -= 1;
+                    }
+                }
+            }
+            KeyCode::Right => {
+                if *cursor < buffer.len() {
+                    *cursor += 1;
+                    while *cursor < buffer.len() && !buffer.is_char_boundary(*cursor) {
+                        *cursor += 1;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                // Take ownership of buffer via swap
+                let mode = std::mem::replace(&mut self.input_mode, InputMode::Normal);
+                match mode {
+                    InputMode::SavePrompt { buffer, .. } => {
+                        if !buffer.is_empty() {
+                            self.save_to_path(&buffer);
+                        }
+                    }
+                    InputMode::ImportPrompt { buffer, .. } => {
+                        if !buffer.is_empty() {
+                            self.import_from_path(&buffer);
+                        }
+                    }
+                    InputMode::Normal => {}
+                }
+            }
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    fn save_to_path(&mut self, path: &str) {
         let now = chrono::Local::now();
-        let filename = format!("dbprobe-{}.json", now.format("%Y%m%dT%H%M%S"));
 
         // Build snapshot from active tab's data
         let (buckets, total_queries, total_errors, active_connections, top_queries, events) =
@@ -394,9 +474,9 @@ impl TuiApp {
 
         let message = match serde_json::to_string_pretty(&snapshot)
             .map_err(io::Error::other)
-            .and_then(|json| std::fs::write(&filename, json))
+            .and_then(|json| std::fs::write(path, json))
         {
-            Ok(()) => format!("Saved snapshot to {filename}"),
+            Ok(()) => format!("Saved snapshot to {path}"),
             Err(e) => format!("Save failed: {e}"),
         };
 
@@ -411,6 +491,158 @@ impl TuiApp {
             style: Style::default().fg(Color::Cyan),
         });
 
+        if self.auto_scroll {
+            self.scroll_to_bottom();
+        }
+    }
+
+    fn import_from_path(&mut self, path: &str) {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.push_status_message(format!("Import failed: {e}"));
+                return;
+            }
+        };
+
+        let snapshot: Snapshot = match serde_json::from_str(&content) {
+            Ok(s) => s,
+            Err(e) => {
+                self.push_status_message(format!("Import failed: invalid JSON: {e}"));
+                return;
+            }
+        };
+
+        // Reconstruct latency buckets
+        let latency_buckets = [
+            snapshot.latency_buckets.under_1ms,
+            snapshot.latency_buckets.ms_1_5,
+            snapshot.latency_buckets.ms_5_10,
+            snapshot.latency_buckets.ms_10_50,
+            snapshot.latency_buckets.ms_50_100,
+            snapshot.latency_buckets.over_100ms,
+        ];
+
+        // Reconstruct fingerprint aggregates from top_queries
+        let mut fingerprints = HashMap::new();
+        for q in &snapshot.top_queries {
+            let total_duration = Duration::from_secs_f64(q.avg_ms * q.count as f64 / 1000.0);
+            fingerprints.insert(q.fingerprint.clone(), QueryAggregates {
+                fingerprint: q.fingerprint.clone(),
+                count: q.count,
+                total_duration,
+                min_duration: Duration::from_secs_f64(q.min_ms / 1000.0),
+                max_duration: Duration::from_secs_f64(q.max_ms / 1000.0),
+            });
+        }
+
+        let stats = FrozenStats {
+            fingerprints,
+            latency_buckets,
+            total_queries: snapshot.total_queries,
+            total_errors: snapshot.total_errors,
+            active_connections: snapshot.active_connections,
+            first_query_at: None,
+        };
+
+        // Reconstruct event rows
+        let now = Instant::now();
+        let events: VecDeque<QueryRow> = snapshot.recent_events.into_iter().map(|ev| {
+            let msg = &ev.message;
+
+            if msg.starts_with("ERR ") {
+                QueryRow {
+                    time: ev.time,
+                    instant: now,
+                    conn_id: ev.conn_id,
+                    latency: ev.latency,
+                    raw_sql: None,
+                    rows_suffix: String::new(),
+                    display: msg.clone(),
+                    style: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                }
+            } else if msg.starts_with("++ ") || msg.starts_with("-- ") {
+                QueryRow {
+                    time: ev.time,
+                    instant: now,
+                    conn_id: ev.conn_id,
+                    latency: ev.latency,
+                    raw_sql: None,
+                    rows_suffix: String::new(),
+                    display: msg.clone(),
+                    style: Style::default().fg(Color::DarkGray),
+                }
+            } else if msg.starts_with("WARN:") {
+                QueryRow {
+                    time: ev.time,
+                    instant: now,
+                    conn_id: ev.conn_id,
+                    latency: ev.latency,
+                    raw_sql: None,
+                    rows_suffix: String::new(),
+                    display: msg.clone(),
+                    style: Style::default().fg(Color::Yellow),
+                }
+            } else {
+                // Query event — split trailing " [N]" into rows_suffix
+                let (sql, rows_suffix) = if let Some(bracket_pos) = msg.rfind(" [") {
+                    if msg.ends_with(']') {
+                        (msg[..bracket_pos].to_string(), msg[bracket_pos..].to_string())
+                    } else {
+                        (msg.clone(), String::new())
+                    }
+                } else {
+                    (msg.clone(), String::new())
+                };
+
+                // Parse latency for style
+                let ms: f64 = ev.latency.trim_end_matches("ms").parse().unwrap_or(0.0);
+                let style = latency_style(ms, self.threshold_ms);
+
+                QueryRow {
+                    time: ev.time,
+                    instant: now,
+                    conn_id: ev.conn_id,
+                    latency: ev.latency,
+                    raw_sql: Some(sql),
+                    rows_suffix,
+                    display: String::new(),
+                    style,
+                }
+            }
+        }).collect();
+
+        // Extract filename for tab label
+        let label = std::path::Path::new(path)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string());
+
+        self.frozen_tabs.push(FrozenTab {
+            label,
+            events,
+            stats,
+            scroll_offset: 0,
+            auto_scroll: true,
+            show_fingerprints: false,
+        });
+        self.active_tab = self.frozen_tabs.len(); // switch to new tab
+
+        self.push_status_message(format!("Imported snapshot from {path}"));
+    }
+
+    fn push_status_message(&mut self, message: String) {
+        let now = chrono::Local::now();
+        self.events.push_back(QueryRow {
+            time: now.format("%H:%M:%S%.3f").to_string(),
+            instant: Instant::now(),
+            conn_id: 0,
+            latency: String::new(),
+            raw_sql: None,
+            rows_suffix: String::new(),
+            display: message,
+            style: Style::default().fg(Color::Cyan),
+        });
         if self.auto_scroll {
             self.scroll_to_bottom();
         }
@@ -486,6 +718,11 @@ impl TuiApp {
         }
 
         self.draw_footer(frame, main_chunks[4]);
+
+        // Draw prompt overlay last (on top of everything)
+        if !matches!(self.input_mode, InputMode::Normal) {
+            self.draw_prompt(frame, area);
+        }
     }
 
     fn draw_tab_bar(&self, frame: &mut Frame, area: Rect) {
@@ -526,7 +763,7 @@ impl TuiApp {
     }
 
     fn draw_query_table_ctx(frame: &mut Frame, area: Rect, ctx: &mut DrawContext) {
-        let inner_height = area.height.saturating_sub(2) as usize; // borders
+        let inner_height = area.height.saturating_sub(3) as usize; // borders + header row
 
         // Clamp scroll offset
         let max_scroll = ctx.events.len().saturating_sub(inner_height);
@@ -703,11 +940,53 @@ impl TuiApp {
         frame.render_widget(table, area);
     }
 
+    fn draw_prompt(&self, frame: &mut Frame, area: Rect) {
+        let (title, buffer, cursor) = match &self.input_mode {
+            InputMode::SavePrompt { buffer, cursor } => ("Save As", buffer.as_str(), *cursor),
+            InputMode::ImportPrompt { buffer, cursor } => ("Import File", buffer.as_str(), *cursor),
+            InputMode::Normal => return,
+        };
+
+        let width = 50u16.min(area.width.saturating_sub(4));
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + area.height / 2 - 2;
+        let prompt_area = Rect::new(x, y, width, 4);
+
+        // Clear background
+        let clear = ratatui::widgets::Clear;
+        frame.render_widget(clear, prompt_area);
+
+        let inner_width = width.saturating_sub(4) as usize;
+        // Scroll the visible portion if buffer is wider than the box
+        let visible_start = cursor.saturating_sub(inner_width);
+        let visible_end = (visible_start + inner_width).min(buffer.len());
+        let visible_text = &buffer[visible_start..visible_end];
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {title} "))
+            .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+
+        let inner = block.inner(prompt_area);
+        frame.render_widget(block, prompt_area);
+
+        let input_line = Paragraph::new(visible_text);
+        frame.render_widget(input_line, Rect::new(inner.x, inner.y, inner.width, 1));
+
+        let hint = Paragraph::new("Enter:confirm  Esc:cancel")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(hint, Rect::new(inner.x, inner.y + 1, inner.width, 1));
+
+        // Position cursor
+        let cursor_x = inner.x + (cursor - visible_start) as u16;
+        frame.set_cursor_position((cursor_x, inner.y));
+    }
+
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let help = if self.frozen_tabs.is_empty() {
-            " q:quit  j/k:scroll  G:bottom  g:top  f:fingerprint  p:pause  r:reset  s:save  t:new-tab ".to_string()
+            " q:quit  j/k:scroll  G:bottom  g:top  f:fingerprint  p:pause  r:reset  s:save  i:import  t:new-tab ".to_string()
         } else {
-            " q:quit  j/k:scroll  G:bottom  g:top  f:fingerprint  p:pause  r:reset  s:save  t:new-tab  Tab:switch  x:close ".to_string()
+            " q:quit  j/k:scroll  G:bottom  g:top  f:fingerprint  p:pause  r:reset  s:save  i:import  t:new-tab  Tab:switch  x:close ".to_string()
         };
         let style = Style::default().fg(Color::DarkGray);
         let para = Paragraph::new(help).style(style);
