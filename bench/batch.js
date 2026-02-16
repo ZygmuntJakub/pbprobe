@@ -4,7 +4,9 @@ const BatchQuery = require('pg-batch-query').default;
 const PORT = 5433;
 const SETUP_PORT = 5432;
 const RUNS = 5;
-const SIZES = [10, 50, 100, 500, 1000, 5000];
+const SIZES = [10, 50, 100, 500, 1000];
+const WRITE_SIZES = [10, 50, 100, 500, 1000];
+const UPDATE_SIZES = [10, 50, 100, 500];
 
 const connConfig = (port) => ({
   host: 'localhost',
@@ -54,7 +56,30 @@ async function setup() {
 }
 
 function randomIds(n) {
-  return Array.from({ length: n }, () => Math.floor(Math.random() * 1000) + 1);
+  // Unique IDs via Fisher-Yates shuffle, take first n (capped at 1000).
+  const all = Array.from({ length: 1000 }, (_, i) => i + 1);
+  for (let i = all.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [all[i], all[j]] = [all[j], all[i]];
+  }
+  return all.slice(0, Math.min(n, 1000));
+}
+
+/// Pre-generate all test data so every strategy operates on identical inputs.
+function generateFixtures() {
+  const readScaling = {};
+  for (const n of SIZES) {
+    readScaling[n] = randomIds(n);
+  }
+
+  const readPayload = randomIds(500);
+
+  const updateScaling = {};
+  for (const n of UPDATE_SIZES) {
+    updateScaling[n] = randomIds(n);
+  }
+
+  return { readScaling, readPayload, updateScaling };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -110,13 +135,15 @@ const STRATEGIES = {
   },
 
   any: {
-    description: 'ANY($1::int[]) — single query with array parameter (reads only)',
+    description: 'ANY($1::int[]) — single query with array parameter (reads only, different pattern)',
     reads: async (client, ids) => {
       await client.query(
-        'SELECT id FROM users WHERE id = ANY($1::int[]) ORDER BY id',
+        'SELECT id FROM users WHERE id = ANY($1::int[])',
         [ids],
       );
     },
+    // Payload test (narrow/wide/fat) not applicable — query shape is fixed
+    payloadReads: false,
     writes: null,
     updates: null,
   },
@@ -138,13 +165,20 @@ async function run(label, fn, warmupFn) {
         await warmupFn(client);
       }
 
-      await Promise.race([
-        fn(client).then(() => client.end()),
-        sleep(RUN_TIMEOUT_MS).then(() => {
-          client.end().catch(() => {});
-          throw new Error('timeout');
-        }),
-      ]);
+      let timer;
+      try {
+        await Promise.race([
+          fn(client).then(() => client.end()),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => {
+              client.end().catch(() => {});
+              reject(new Error('timeout'));
+            }, RUN_TIMEOUT_MS);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
     }
     console.log(`    ${label} done`);
   } catch (err) {
@@ -152,7 +186,7 @@ async function run(label, fn, warmupFn) {
   }
 }
 
-async function runReads(strategy) {
+async function runReads(strategy, fixtures) {
   const queries = {
     narrow: 'SELECT id FROM users WHERE id = $1',
     wide: 'SELECT * FROM users WHERE id = $1',
@@ -165,7 +199,7 @@ async function runReads(strategy) {
       console.log(`    N=${n} — not supported`);
       continue;
     }
-    const ids = randomIds(n);
+    const ids = fixtures.readScaling[n];
     const warmup = async (c) => {
       for (let i = 0; i < 10; i++) await c.query('SELECT 1');
     };
@@ -174,12 +208,16 @@ async function runReads(strategy) {
   }
 
   console.log('\n  reads — payload (N=500)');
+  if (strategy.payloadReads === false) {
+    console.log('    (skipped — fixed query shape)');
+    return;
+  }
   for (const [label, query] of Object.entries(queries)) {
     if (strategy.reads === null) {
       console.log(`    ${label} — not supported`);
       continue;
     }
-    const ids = randomIds(500);
+    const ids = fixtures.readPayload;
     const warmup = async (c) => {
       for (let i = 0; i < 10; i++) await c.query(query, [1]);
     };
@@ -189,16 +227,14 @@ async function runReads(strategy) {
 }
 
 async function runWrites(strategy) {
-  const sizes = [10, 50, 100, 500, 1000];
-
   console.log('\n  writes — INSERT scaling');
-  for (const n of sizes) {
+  for (const n of WRITE_SIZES) {
     if (strategy.writes === null) {
       console.log(`    N=${n} — not supported`);
       continue;
     }
     const warmup = async (c) => {
-      await c.query('DELETE FROM batch_test');
+      await c.query('SELECT 1');
     };
     await run(`N=${n}`, async (c) => {
       await c.query('DELETE FROM batch_test');
@@ -208,16 +244,14 @@ async function runWrites(strategy) {
   }
 }
 
-async function runUpdates(strategy) {
-  const sizes = [10, 50, 100, 500];
-
+async function runUpdates(strategy, fixtures) {
   console.log('\n  updates — UPDATE scaling');
-  for (const n of sizes) {
+  for (const n of UPDATE_SIZES) {
     if (strategy.updates === null) {
       console.log(`    N=${n} — not supported`);
       continue;
     }
-    const ids = randomIds(n);
+    const ids = fixtures.updateScaling[n];
     const warmup = async (c) => {
       await c.query('SELECT 1');
     };
@@ -229,40 +263,49 @@ async function runUpdates(strategy) {
 // --- Main ---
 
 async function main() {
-  const arg = process.argv[2];
   const strategyNames = Object.keys(STRATEGIES);
 
-  if (arg === '--help' || arg === '-h') {
-    console.log(`Usage: node batch.js <${strategyNames.join('|')}>`);
-    console.log('  Runs all workloads with the chosen strategy through dbprobe (:5433).');
-    console.log('  No argument runs all strategies.\n');
+  const args = process.argv.slice(2);
+  const readOnly = args.includes('read-only');
+  const strategyArg = args.find((a) => a !== 'read-only');
+
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(`Usage: node batch.js [${strategyNames.join('|')}] [read-only]`);
+    console.log('  Runs workloads with the chosen strategy through dbprobe (:5433).');
+    console.log('  No strategy argument runs all strategies.');
+    console.log('  "read-only" skips writes and updates.\n');
     for (const [name, s] of Object.entries(STRATEGIES)) {
       console.log(`  ${name.padEnd(12)} ${s.description}`);
     }
     process.exit(0);
   }
 
-  if (arg && !STRATEGIES[arg]) {
+  if (strategyArg && !STRATEGIES[strategyArg]) {
     console.error(
-      `Unknown strategy: ${arg}\nAvailable: ${strategyNames.join(', ')}`,
+      `Unknown strategy: ${strategyArg}\nAvailable: ${strategyNames.join(', ')}`,
     );
     process.exit(1);
   }
 
   await setup();
 
-  const selected = arg
-    ? { [arg]: STRATEGIES[arg] }
+  const fixtures = generateFixtures();
+  console.log('Generated test fixtures (shared across all strategies).');
+
+  const selected = strategyArg
+    ? { [strategyArg]: STRATEGIES[strategyArg] }
     : STRATEGIES;
 
   const t0 = performance.now();
 
   for (const [name, strategy] of Object.entries(selected)) {
-    console.log(`\n=== ${name} — ${strategy.description} ===`);
+    console.log(`\n=== ${name} — ${strategy.description}${readOnly ? ' (read-only)' : ''} ===`);
 
-    await runReads(strategy);
-    await runWrites(strategy);
-    await runUpdates(strategy);
+    await runReads(strategy, fixtures);
+    if (!readOnly) {
+      await runWrites(strategy);
+      await runUpdates(strategy, fixtures);
+    }
 
     console.log(`\n=== ${name} done ===`);
     await sleep(500);
