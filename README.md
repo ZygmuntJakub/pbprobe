@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">dbprobe</h1>
+  <h1 align="center">pbprobe</h1>
   <p align="center">
     Real-time database query interceptor with a live TUI dashboard
   </p>
